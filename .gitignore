@@ -1,0 +1,6 @@
+Llama3.2-1B-Instruct/*
+
+__pycache__/*
+
+.DS_Store
+
