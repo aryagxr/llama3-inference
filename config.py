@@ -1,4 +1,5 @@
 import json
+import torch
 
 with open("Llama3.2-1B-Instruct/params.json", "r") as f:
     config = json.load(f)
@@ -19,3 +20,7 @@ USE_SCALED_ROPE = config['use_scaled_rope']
 if __name__ == "__main__":
     print("Model Configuration:")
     print(config)
+
+    model = torch.load("Llama3.2-1B-Instruct/consolidated.00.pth", map_location=torch.device('cpu'))
+    print(json.dumps(list(model.keys())[:40], indent=4))
+    print(model["layers.0.ffn_norm.weight"].shape)

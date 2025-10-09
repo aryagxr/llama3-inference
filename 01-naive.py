@@ -16,6 +16,7 @@ import tokenizer
 # ffn
 
 
+# ffn_norm weights shape (2048)
 class RMSNorm(nn.Module):
     def __init__(self, dim, weight, eps=config.NORM_EPS):
         super().__init__()
@@ -23,11 +24,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(weight)
 
     def _norm(self, x):
-        pass
+        return torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        pass
-
+        return self._norm(x) * x * self.weight
 
 
 
@@ -42,8 +42,16 @@ def precompute_freqs_cis(head_dim, end, theta=config.ROPE_THETA):
 
 
 
-def RoPE(x, cos, sin):
-    pass
+def apply_RoPE(x, freqs_cos, freqs_sin):
+    x_even = x[:,::2]
+    x_odd = x[:, 1::2]
+    x_even_rot = x_even * freqs_cos - x_odd * freqs_sin
+    x_odd_rot = x_even * freqs_sin + x_odd * freqs_cos
+    x_rot = torch.zeros_like(x)
+    x_rot[:,::2] = x_even_rot
+    x_rot[:,1::2] = x_odd_rot
+    return x_rot
+
 
 
 class MHA(nn.Module):
