@@ -12,9 +12,22 @@ import tokenizer
 model = torch.load("Llama3.2-1B-Instruct/consolidated.00.pth", map_location=torch.device('cpu'))
 
 
+prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|><br><br>An apple a day keeps the doctor<|eot_id|><|start_header_id|>assistant<|end_header_id|><br><br>"
+
+
+encoded = tokenizer.enc.encode(prompt, allowed_special="all")
+print(encoded)
+
+token_ids = torch.tensor(encoded)
+print(token_ids)
+
+print(token_ids.shape)
+seq_len = token_ids.shape[0]
+
+
 # ffn_norm weights shape (2048)
 class RMSNorm(nn.Module):
-    def __init__(self, dim, weight, eps=config.NORM_EPS):
+    def __init__(self, weight, eps=config.NORM_EPS):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(weight)
@@ -169,60 +182,137 @@ class FeedForward(nn.Module):
 # add attn norm
 # add ffn norm
 class TransformerBlock(nn.Module):
-    pass
+    def __init__(self, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.attn = MHA(
+            model[f"layers.{layer_idx}.attention.wq.weight"], 
+            model[f"layers.{layer_idx}.attention.wk.weight"], 
+            model[f"layers.{layer_idx}.attention.wv.weight"], 
+            model[f"layers.{layer_idx}.attention.wo.weight"], 
+            seq_len,
+        )
+        self.ffn = FeedForward(
+            model[f"layers.{layer_idx}.feed_forward.w1.weight"], 
+            model[f"layers.{layer_idx}.feed_forward.w3.weight"], 
+            model[f"layers.{layer_idx}.feed_forward.w2.weight"],
+        )
+        
+        self.attn_norm = RMSNorm(model[f"layers.{layer_idx}.attention_norm.weight"])
+        self.ffn_norm = RMSNorm(model[f"layers.{layer_idx}.ffn_norm.weight"])
+
+    def forward(self, x):
+        # change x to bfloat16
+        x = x.to(torch.bfloat16)
+        attn_out = x + self.attn(self.attn_norm(x))
+        ffn_out = attn_out + self.ffn(self.ffn_norm(attn_out))
+        return ffn_out
+
+
+
+    
 
 
 
 class Transformer(nn.Module):
-    pass
+    def __init__(self):
+        super().__init__()
+        self.n_layers = config.N_LAYERS
+        self.vocab_size = config.VOCAB_SIZE
+        
+        self.tok_emb = nn.Embedding.from_pretrained(
+            model["tok_embeddings.weight"], 
+            freeze=True
+        )
+        
+        # Final normalization layer
+        self.norm = RMSNorm(model["norm.weight"])
+        
+        # Output projection layer (hidden_dim -> vocab_size)
+        self.output_weights = nn.Parameter(model["output.weight"])
+        
+        self.layers = nn.ModuleList()
+        for layer_idx in range(self.n_layers):
+            self.layers.append(TransformerBlock(layer_idx))
 
+        
+    def forward(self, tokens):
+        x = self.tok_emb(tokens)
+        print("input_emb", x.shape)
 
+        for layer in self.layers:
+            x = layer(x)
+        
+        x = self.norm(x)
+        print("after norm", x.shape)
+        
+        logits = torch.matmul(x, self.output_weights.T).float()
+        print("logits", logits)
+        print("logits", logits.shape)
+        
+        return logits
 
-
-
-
+        
+        
 
 
 
 # need to chat template prompt
 # prompt = "Are you a pirate?"
-prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|><br><br>Are you a pirate?<|eot_id|><|start_header_id|>assistant<|end_header_id|><br><br>"
 
-encoded = tokenizer.enc.encode(prompt, allowed_special="all")
-print(encoded)
-
-token_ids = torch.tensor(encoded)
-print(token_ids)
-
-print(token_ids.shape)
 
 # create embedding layer 
 # CHANGE TO USE TOK EMBEDDING WEIGHT FORM MODEL
-emb_layer = nn.Embedding(config.VOCAB_SIZE, config.DIM)
+# emb_layer = nn.Embedding(config.VOCAB_SIZE, config.DIM)
 # print(emb_layer)
-print(emb_layer.weight.shape)
+# print(emb_layer.weight.shape)
 
 # input 
-x = emb_layer(token_ids)
-print("x", x)
-print("x.shape", x.shape)
+# x = emb_layer(token_ids)
+# print("x", x)
+# print("x.shape", x.shape)
 
 
 
 
 # call mha and test forward pass
 # pass in weights from model
-MHA = MHA(model["layers.0.attention.wq.weight"], model["layers.0.attention.wk.weight"], model["layers.0.attention.wv.weight"], model["layers.0.attention.wo.weight"], 25)
-MHA(x)
-print("MHA(x)", MHA(x))
-print("MHA(x).shape", MHA(x).shape)
+# MHA = MHA(model["layers.0.attention.wq.weight"], model["layers.0.attention.wk.weight"], model["layers.0.attention.wv.weight"], model["layers.0.attention.wo.weight"], 25)
+# MHA(x)
+# print("MHA(x)", MHA(x))
+# print("MHA(x).shape", MHA(x).shape)
 
 
 # feed forward "layers.0.feed_forward.w1.weight"
-FeedForward = FeedForward(model["layers.0.feed_forward.w1.weight"], model["layers.0.feed_forward.w3.weight"], model["layers.0.feed_forward.w2.weight"])
-print("FeedForward(MHA(x))", FeedForward(MHA(x)))
-print("FeedForward(MHA(x)).shape", FeedForward(MHA(x)).shape)
+# FeedForward = FeedForward(model["layers.0.feed_forward.w1.weight"], model["layers.0.feed_forward.w3.weight"], model["layers.0.feed_forward.w2.weight"])
+# print("FeedForward(MHA(x))", FeedForward(MHA(x)))
+# print("FeedForward(MHA(x)).shape", FeedForward(MHA(x)).shape)
 
 print("model['layers.0.feed_forward.w1.weight'].shape", model["layers.0.feed_forward.w1.weight"].shape)
 print("model['layers.0.feed_forward.w3.weight'].shape", model["layers.0.feed_forward.w3.weight"].shape)
 print("model['layers.0.feed_forward.w2.weight'].shape", model["layers.0.feed_forward.w2.weight"].shape)
+
+# transformer block
+# TransformerBlock = TransformerBlock(0)
+# print("TransformerBlock(x)", TransformerBlock(x))
+# print("TransformerBlock(x).shape", TransformerBlock(x).shape)
+
+# transformer
+Transformer = Transformer()
+# print("Transformer(token_ids)", Transformer(token_ids))
+# print("Transformer(token_ids).shape", Transformer(token_ids).shape)
+
+# convert logits to token ids
+logits = Transformer(token_ids)
+print("logits", logits)
+print("logits.shape", logits.shape)
+
+
+# somthing wrong from here
+next_token_id = torch.argmax(logits[-1], dim=-1).item()
+print("output_token_ids", next_token_id)
+
+
+decoded = tokenizer.enc.decode([next_token_id])
+print("decoded", decoded)
+
