@@ -149,20 +149,25 @@ class MHA(nn.Module):
 
         
 
-        
+class FeedForward(nn.Module):
+    def __init__(self, w1, w3, w2):
+        super().__init__()
+        self.w1 = nn.Parameter(w1)
+        self.w3 = nn.Parameter(w3)
+        self.w2 = nn.Parameter(w2)
 
 
     
-
-
- 
-
-
-class FeedForward(nn.Module):
-    pass
+    def forward(self, x):
+        return torch.matmul(
+            (F.silu(torch.matmul(x, self.w1.T)) * torch.matmul(x, self.w3.T)),
+            self.w2.T
+        )
 
 
 
+# add attn norm
+# add ffn norm
 class TransformerBlock(nn.Module):
     pass
 
@@ -191,7 +196,8 @@ print(token_ids)
 
 print(token_ids.shape)
 
-# create embedding layer
+# create embedding layer 
+# CHANGE TO USE TOK EMBEDDING WEIGHT FORM MODEL
 emb_layer = nn.Embedding(config.VOCAB_SIZE, config.DIM)
 # print(emb_layer)
 print(emb_layer.weight.shape)
@@ -210,3 +216,13 @@ MHA = MHA(model["layers.0.attention.wq.weight"], model["layers.0.attention.wk.we
 MHA(x)
 print("MHA(x)", MHA(x))
 print("MHA(x).shape", MHA(x).shape)
+
+
+# feed forward "layers.0.feed_forward.w1.weight"
+FeedForward = FeedForward(model["layers.0.feed_forward.w1.weight"], model["layers.0.feed_forward.w3.weight"], model["layers.0.feed_forward.w2.weight"])
+print("FeedForward(MHA(x))", FeedForward(MHA(x)))
+print("FeedForward(MHA(x)).shape", FeedForward(MHA(x)).shape)
+
+print("model['layers.0.feed_forward.w1.weight'].shape", model["layers.0.feed_forward.w1.weight"].shape)
+print("model['layers.0.feed_forward.w3.weight'].shape", model["layers.0.feed_forward.w3.weight"].shape)
+print("model['layers.0.feed_forward.w2.weight'].shape", model["layers.0.feed_forward.w2.weight"].shape)
