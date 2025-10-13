@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import time
 
 import config
 import tokenizer
@@ -12,17 +13,17 @@ import tokenizer
 model = torch.load("Llama3.2-1B-Instruct/consolidated.00.pth", map_location=torch.device('cpu'))
 
 
-prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|><br><br>An apple a day keeps the doctor<|eot_id|><|start_header_id|>assistant<|end_header_id|><br><br>"
+prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|><br><br>If mountains could talk<|eot_id|><|start_header_id|>assistant<|end_header_id|><br><br>"
 
 
 encoded = tokenizer.enc.encode(prompt, allowed_special="all")
-print(encoded)
+# print(encoded)
 
 token_ids = torch.tensor(encoded)
-print(token_ids)
+# print(token_ids)
 
 print(token_ids.shape)
-seq_len = token_ids.shape[0]
+# seq_len = token_ids.shape[0]
 
 
 # ffn_norm weights shape (2048)
@@ -83,13 +84,12 @@ def repeat_kv():
 # apply softmax to this
 # multiply the whole thing by V
 class MHA(nn.Module):
-    def __init__(self, wq, wk, wv, wo, seq_len, n_heads=config.N_HEADS, n_kv_heads=config.N_KV_HEADS):
+    def __init__(self, wq, wk, wv, wo, n_heads=config.N_HEADS, n_kv_heads=config.N_KV_HEADS):
         super().__init__()
         self.wq = nn.Parameter(wq)
         self.wk = nn.Parameter(wk)
         self.wv = nn.Parameter(wv)
         self.wo = nn.Parameter(wo)
-        self.seq_len = seq_len # input prompt length
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = config.DIM // self.n_heads # 32 heads * 64 dim = 2048 dim
@@ -97,6 +97,7 @@ class MHA(nn.Module):
 
     # x is input embeddings 
     def forward(self, x):
+        seq_len = x.shape[0]  # Get current sequence length dynamically
         
         # QKV per token matrix: [seq_len, 2048]
         x = x.to(self.wq.dtype)
@@ -112,11 +113,11 @@ class MHA(nn.Module):
         
 
         # reshape them to (batch, n_heads, seq_len, head_dim)
-        Q = Q.view(self.seq_len, self.n_heads, self.head_dim) # seq_len, 32, 64
-        K = K.view(self.seq_len, self.n_kv_heads, self.head_dim) # seq_len, 8, 64
-        V = V.view(self.seq_len, self.n_kv_heads, self.head_dim) # seq_len, 8, 64
+        Q = Q.view(seq_len, self.n_heads, self.head_dim) # seq_len, 32, 64
+        K = K.view(seq_len, self.n_kv_heads, self.head_dim) # seq_len, 8, 64
+        V = V.view(seq_len, self.n_kv_heads, self.head_dim) # seq_len, 8, 64
 
-        freqs_cos, freqs_sin = precompute_freqs_cis(self.head_dim, self.seq_len)
+        freqs_cos, freqs_sin = precompute_freqs_cis(self.head_dim, seq_len)
         # print("Q before RoPE", Q.shape)
         # print("K before RoPE", K.shape)
         
@@ -127,34 +128,34 @@ class MHA(nn.Module):
 
         K_repeated = torch.repeat_interleave(K, self.n_heads//self.n_kv_heads, dim=1)
         V_repeated = torch.repeat_interleave(V, self.n_heads//self.n_kv_heads, dim=1)
-        print("K_repeated", K_repeated.shape)
-        print("V_repeated", V_repeated.shape)
+        # print("K_repeated", K_repeated.shape)
+        # print("V_repeated", V_repeated.shape)
 
         # swap seq_len and n_heads dimensions
         Q = Q.transpose(0, 1)
-        print("Q transposed", Q.shape)
+        # print("Q transposed", Q.shape)
         K_repeated = K_repeated.transpose(0, 1)
         V_repeated = V_repeated.transpose(0, 1)
-        print("K_repeated transposed", K_repeated.shape)
+        # print("K_repeated transposed", K_repeated.shape)
 
         attn_scores = Q @ K_repeated.transpose(1,2) / math.sqrt(self.head_dim)
-        print("attn_scores", attn_scores.shape) # output: (n_heads, seq_len, seq_len)
+        # print("attn_scores", attn_scores.shape) # output: (n_heads, seq_len, seq_len)
 
-        mask = torch.full((self.seq_len, self.seq_len), float('-inf'))
+        mask = torch.full((seq_len, seq_len), float('-inf'))
         mask = mask.triu(diagonal=1)
-        print("mask", mask)
+        # print("mask", mask)
 
         attn_scores = attn_scores + mask
-        print("attn_scores with mask", attn_scores)
+        # print("attn_scores with mask", attn_scores)
 
         attn_probs = F.softmax(attn_scores.float(), dim=-1).type_as(Q)
-        print("attn_probs", attn_probs.shape)
+        # print("attn_probs", attn_probs.shape)
 
         output = attn_probs @ V_repeated
-        print("output", output.shape)
+        # print("output", output.shape)
 
-        output = output.transpose(0, 1).contiguous().view(self.seq_len, -1)
-        print("output", output.shape)
+        output = output.transpose(0, 1).contiguous().view(seq_len, -1)
+        # print("output", output.shape)
 
         return torch.matmul(output, self.wo.T)
         
@@ -189,8 +190,7 @@ class TransformerBlock(nn.Module):
             model[f"layers.{layer_idx}.attention.wq.weight"], 
             model[f"layers.{layer_idx}.attention.wk.weight"], 
             model[f"layers.{layer_idx}.attention.wv.weight"], 
-            model[f"layers.{layer_idx}.attention.wo.weight"], 
-            seq_len,
+            model[f"layers.{layer_idx}.attention.wo.weight"]
         )
         self.ffn = FeedForward(
             model[f"layers.{layer_idx}.feed_forward.w1.weight"], 
@@ -238,17 +238,17 @@ class Transformer(nn.Module):
         
     def forward(self, tokens):
         x = self.tok_emb(tokens)
-        print("input_emb", x.shape)
+        # print("input_emb", x.shape)
 
         for layer in self.layers:
             x = layer(x)
         
         x = self.norm(x)
-        print("after norm", x.shape)
+        # print("after norm", x.shape)
         
         logits = torch.matmul(x, self.output_weights.T).float()
-        print("logits", logits)
-        print("logits", logits.shape)
+        # print("logits", logits)
+        # print("logits", logits.shape)
         
         return logits
 
@@ -256,63 +256,175 @@ class Transformer(nn.Module):
         
 
 
+# Performance measurement
+class PerformanceMetrics:
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.start_time = None
+        self.first_token_time = None
+        self.end_time = None
+        self.token_times = []
+        self.total_tokens_generated = 0
+        self.input_tokens = 0
+    
+    def start_generation(self, input_tokens):
+        self.input_tokens = len(input_tokens)
+        self.start_time = time.time()
+    
+    def record_first_token(self):
+        self.first_token_time = time.time()
+    
+    def record_token(self):
+        current_time = time.time()
+        self.token_times.append(current_time)
+        self.total_tokens_generated += 1
+    
+    def end_generation(self):
+        self.end_time = time.time()
+    
+    def calculate_metrics(self):
+        if not all([self.start_time, self.first_token_time, self.end_time]):
+            return None
+        
+        # Time to First Token (TTFT)
+        ttft = self.first_token_time - self.start_time
+        
+        # End-to-End Latency (E2EL)
+        e2el = self.end_time - self.start_time
+        
+        # Token Generation Time (excluding TTFT)
+        token_gen_time = e2el - ttft
+        
+        # Time per Output Token (TPOT)
+        output_tokens = self.total_tokens_generated - self.input_tokens
+        tpot = token_gen_time / max(output_tokens - 1, 1) if output_tokens > 1 else 0
+        
+        # Inter-Token Latency (ITL) - average time between consecutive tokens
+        itl_times = []
+        for i in range(1, len(self.token_times)):
+            itl_times.append(self.token_times[i] - self.token_times[i-1])
+        avg_itl = sum(itl_times) / len(itl_times) if itl_times else 0
+        
+        # Tokens per second
+        tokens_per_second = output_tokens / token_gen_time if token_gen_time > 0 else 0
+        
+        # Throughput (total tokens / total time)
+        throughput = self.total_tokens_generated / e2el if e2el > 0 else 0
+        
+        return {
+            'TTFT': ttft,
+            'E2EL': e2el,
+            'Token_Generation_Time': token_gen_time,
+            'TPOT': tpot,
+            'Average_ITL': avg_itl,
+            'Tokens_Per_Second': tokens_per_second,
+            'Throughput': throughput,
+            'Total_Tokens': self.total_tokens_generated,
+            'Output_Tokens': output_tokens,
+            'Input_Tokens': self.input_tokens
+        }
+    
+    def print_metrics(self):
+        metrics = self.calculate_metrics()
+        if not metrics:
+            print("No metrics available")
+            return
+        
+        print("\n")
+        # print("\n" + "="*60)
+        print("[PERFORMANCE METRICS]")
+        # print("="*60)
+        print(f"Time to First Token (TTFT):     {metrics['TTFT']:.4f} seconds")
+        print(f"End-to-End Latency (E2EL):      {metrics['E2EL']:.4f} seconds")
+        print(f"Token Generation Time:          {metrics['Token_Generation_Time']:.4f} seconds")
+        print(f"Time per Output Token (TPOT):   {metrics['TPOT']:.4f} seconds")
+        print(f"Average Inter-Token Latency:    {metrics['Average_ITL']:.4f} seconds")
+        print(f"Tokens per Second:              {metrics['Tokens_Per_Second']:.2f} tokens/sec")
+        print(f"Throughput:                     {metrics['Throughput']:.2f} tokens/sec")
+        print(f"Total Tokens Generated:          {metrics['Total_Tokens']}")
+        print(f"Output Tokens:                  {metrics['Output_Tokens']}")
+        print(f"Input Tokens:                   {metrics['Input_Tokens']}")
+        print("\n")
 
-# need to chat template prompt
-# prompt = "Are you a pirate?"
 
-
-# create embedding layer 
-# CHANGE TO USE TOK EMBEDDING WEIGHT FORM MODEL
-# emb_layer = nn.Embedding(config.VOCAB_SIZE, config.DIM)
-# print(emb_layer)
-# print(emb_layer.weight.shape)
-
-# input 
-# x = emb_layer(token_ids)
-# print("x", x)
-# print("x.shape", x.shape)
-
-
-
-
-# call mha and test forward pass
-# pass in weights from model
-# MHA = MHA(model["layers.0.attention.wq.weight"], model["layers.0.attention.wk.weight"], model["layers.0.attention.wv.weight"], model["layers.0.attention.wo.weight"], 25)
-# MHA(x)
-# print("MHA(x)", MHA(x))
-# print("MHA(x).shape", MHA(x).shape)
-
-
-# feed forward "layers.0.feed_forward.w1.weight"
-# FeedForward = FeedForward(model["layers.0.feed_forward.w1.weight"], model["layers.0.feed_forward.w3.weight"], model["layers.0.feed_forward.w2.weight"])
-# print("FeedForward(MHA(x))", FeedForward(MHA(x)))
-# print("FeedForward(MHA(x)).shape", FeedForward(MHA(x)).shape)
-
-print("model['layers.0.feed_forward.w1.weight'].shape", model["layers.0.feed_forward.w1.weight"].shape)
-print("model['layers.0.feed_forward.w3.weight'].shape", model["layers.0.feed_forward.w3.weight"].shape)
-print("model['layers.0.feed_forward.w2.weight'].shape", model["layers.0.feed_forward.w2.weight"].shape)
-
-# transformer block
-# TransformerBlock = TransformerBlock(0)
-# print("TransformerBlock(x)", TransformerBlock(x))
-# print("TransformerBlock(x).shape", TransformerBlock(x).shape)
-
-# transformer
 Transformer = Transformer()
-# print("Transformer(token_ids)", Transformer(token_ids))
-# print("Transformer(token_ids).shape", Transformer(token_ids).shape)
-
-# convert logits to token ids
-logits = Transformer(token_ids)
-print("logits", logits)
-print("logits.shape", logits.shape)
 
 
-# somthing wrong from here
-next_token_id = torch.argmax(logits[-1], dim=-1).item()
-print("output_token_ids", next_token_id)
+# Autoregressive generation loop
+def generate_text(transformer, initial_tokens, max_new_tokens=100):
+    """
+    Generate text autoregressively with performance measurement
+    Args:
+        transformer: The trained transformer model
+        initial_tokens: Starting token sequence
+        max_new_tokens: Maximum number of new tokens to generate
+    """
+    # Initialize performance metrics
+    metrics = PerformanceMetrics()
+    metrics.start_generation(initial_tokens)
+    
+    generated_tokens = initial_tokens.clone()
+    
+    print(f"Starting generation with {len(initial_tokens)} initial tokens")
+    print(f"Initial prompt: {tokenizer.enc.decode(initial_tokens.tolist())}")
+    
+    first_token_recorded = False
+    
+    for step in range(max_new_tokens):
+        # Get logits for current sequence
+        logits = transformer(generated_tokens)
+        
+        # Get the logits for the last token (next token prediction)
+        next_token_logits = logits[-1, :]  # Shape: (vocab_size,)
+        
+        # Get the most likely next token
+        next_token_id = torch.argmax(next_token_logits, dim=-1).item()
+        
+        # Record timing for first token
+        if not first_token_recorded:
+            metrics.record_first_token()
+            first_token_recorded = True
+        
+        # Record token generation time
+        metrics.record_token()
+        
+        # Decode the new token to see what was generated
+        new_token_text = tokenizer.enc.decode([next_token_id])
+        print(f"Step {step}: Generated token '{new_token_text}' (ID: {next_token_id})")
+        
+        # Add the new token to the sequence
+        generated_tokens = torch.cat([generated_tokens, torch.tensor([next_token_id])])
+        
+        # Print progress every 50 tokens
+        if step % 50 == 0:
+            current_text = tokenizer.enc.decode(generated_tokens.tolist())
+            print(f"--- Progress: Generated {len(generated_tokens)} tokens total ---")
+            print(f"Current text: {current_text[-100:]}...")  # Show last 100 chars
+        
+        # Optional: Stop if we hit an end token (using the actual token ID)
+        # The EOT token ID is 128010 based on your special tokens
+        if next_token_id == 128010:  # <|eot_id|> token
+            print(f"Stopped at step {step} due to EOT token")
+            break
+    
+    # End generation timing
+    metrics.end_generation()
+    
+    # Print performance metrics
+    metrics.print_metrics()
+    
+    return generated_tokens
 
+# Run generation
+print("Starting autoregressive generation...")
+generated_tokens = generate_text(Transformer, token_ids, max_new_tokens=100)
 
-decoded = tokenizer.enc.decode([next_token_id])
-print("decoded", decoded)
+# Decode the final result
+final_text = tokenizer.enc.decode(generated_tokens.tolist())
+print("\n" + "="*50)
+print("FINAL GENERATED TEXT:")
+print("="*50)
+print(final_text)
 
