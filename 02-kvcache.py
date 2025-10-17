@@ -10,25 +10,23 @@ import tokenizer
 # print(config.DIM)
 # print(tokenizer.enc.encode("Hello, world!"))
 
-
-# OPTIMIZATIONS:
-# KV cache
-# -> store all previous kv matrices
-# -> only compute kv for new tokens
-
 model = torch.load("Llama3.2-1B-Instruct/consolidated.00.pth", map_location=torch.device('cpu'))
 
 
 prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|><br><br>If mountains could talk<|eot_id|><|start_header_id|>assistant<|end_header_id|><br><br>"
-encoded = tokenizer.enc.encode(prompt, allowed_special="all")
-token_ids = torch.tensor(encoded)
-MAX_NEW_TOKENS = 100
 
+
+encoded = tokenizer.enc.encode(prompt, allowed_special="all")
+# print(encoded)
+
+token_ids = torch.tensor(encoded)
+# print(token_ids)
 
 print(token_ids.shape)
+# seq_len = token_ids.shape[0]
 
 
-
+# ffn_norm weights shape (2048)
 class RMSNorm(nn.Module):
     def __init__(self, weight, eps=config.NORM_EPS):
         super().__init__()
@@ -44,10 +42,11 @@ class RMSNorm(nn.Module):
 
 
 # head_dim = 64 
-def precompute_freqs_cis(head_dim, end, start_idx, theta=config.ROPE_THETA):
+
+
+def precompute_freqs_cis(head_dim, end, theta=config.ROPE_THETA):
     freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2)[: (head_dim // 2)].float() / head_dim))
-    # t = torch.arange(end) #  0,1,2...seq_len-1
-    t = torch.arange(start_idx, start_idx+end) # 3,4,5...start_idx+end-1
+    t = torch.arange(end) #  0,1,2...seq_len-1
     freqs_matrix = torch.outer(t, freq) # theta = pos * freq -> shape: (seq_len, head_dim//2)
     freqs_cos = torch.cos(freqs_matrix)
     freqs_sin = torch.sin(freqs_matrix)
@@ -60,8 +59,10 @@ def precompute_freqs_cis(head_dim, end, start_idx, theta=config.ROPE_THETA):
 
 def apply_RoPE(x, freqs_cos, freqs_sin, n_heads):
 
+    # x shape: (seq_len, n_heads, head_dim)
     x_even = x[:, :, ::2]
     x_odd = x[:, :, 1::2]
+    # Expand freqs to match n_heads dimension - reshape for broadcasting func later
     freqs_cos_reshaped = freqs_cos.unsqueeze(1).expand(-1, n_heads, -1)  # (seq_len, n_heads, head_dim//2)
     freqs_sin_reshaped = freqs_sin.unsqueeze(1).expand(-1, n_heads, -1)  # (seq_len, n_heads, head_dim//2)
     x_even_rot = x_even * freqs_cos_reshaped - x_odd * freqs_sin_reshaped
@@ -77,7 +78,13 @@ def apply_RoPE(x, freqs_cos, freqs_sin, n_heads):
 def repeat_kv():
     pass
 
-
+# Find query, key, value matrices (Q = wq * input...)
+# reshape all matrices to (batch, n_heads, seq_len, head_dim)
+# appply rope to Q,K
+# multiply q,kT divide by sqrt d
+# apply masking to this
+# apply softmax to this
+# multiply the whole thing by V
 class MHA(nn.Module):
     def __init__(self, wq, wk, wv, wo, n_heads=config.N_HEADS, n_kv_heads=config.N_KV_HEADS):
         super().__init__()
@@ -88,92 +95,97 @@ class MHA(nn.Module):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = config.DIM // self.n_heads # 32 heads * 64 dim = 2048 dim
+        
+        # Initialize KV cache
         self.k_cache = None
         self.v_cache = None
+        self.cache_len = 0
+
+
+    # x is input embeddings - now only processes new tokens
+    def forward(self, x, mask, start_idx=0):
+        seq_len = x.shape[0]  # Should be 1 for single token generation
         
-
-
-    # x is input embeddings 
-    # need to send only new tokens to the model
-    # start_idx to keep track of the index of the first new token
-    # everything before start_idx is from the cache
-    def forward(self, x, start_idx):
-
-        # if self.k_cache is None:
-        #     self.k_cache = torch.zeros(MAX_NEW_TOKENS, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
-        #     self.v_cache = torch.zeros(MAX_NEW_TOKENS, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
-        if self.k_cache is None:
-            total_cache_len = MAX_NEW_TOKENS + start_idx
-            self.k_cache = torch.zeros(total_cache_len, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
-            self.v_cache = torch.zeros_like(self.k_cache)
-        # seq_len will be 1 after the first loop
-        seq_len = x.shape[0] 
+        # print(f"Processing {seq_len} new tokens starting at position {start_idx}")
         
-        # QKV per token matrix: [seq_len, 2048]
+        # Step 1: Compute Q, K, V for new tokens only
         x = x.to(self.wq.dtype)
-        Q = torch.matmul(x, self.wq.T)
-        K = torch.matmul(x, self.wk.T)
-        V = torch.matmul(x, self.wv.T)
+        Q = torch.matmul(x, self.wq.T)  # [seq_len, 2048]
+        K = torch.matmul(x, self.wk.T)  # [seq_len, 2048] 
+        V = torch.matmul(x, self.wv.T)  # [seq_len, 2048]
         
-        Q = Q.view(seq_len, self.n_heads, self.head_dim) # seq_len, 32, 64
-        K = K.view(seq_len, self.n_kv_heads, self.head_dim) # seq_len, 8, 64
-        V = V.view(seq_len, self.n_kv_heads, self.head_dim) # seq_len, 8, 64
+        # print("Q.shape", Q.shape)
+        # print("K.shape", K.shape) 
+        # print("V.shape", V.shape)
 
-        freqs_cos, freqs_sin = precompute_freqs_cis(self.head_dim, seq_len, start_idx)
+        # Step 2: Reshape to head format
+        Q = Q.view(seq_len, self.n_heads, self.head_dim)     # [seq_len, 32, 64]
+        K = K.view(seq_len, self.n_kv_heads, self.head_dim)  # [seq_len, 8, 64]
+        V = V.view(seq_len, self.n_kv_heads, self.head_dim)  # [seq_len, 8, 64]
+
+        # Step 3: Apply RoPE for current position only
+        current_seq_len = start_idx + seq_len
+        freqs_cos, freqs_sin = precompute_freqs_cis(self.head_dim, current_seq_len)
         
-        Q = apply_RoPE(Q, freqs_cos, freqs_sin, self.n_heads)
-        K = apply_RoPE(K, freqs_cos, freqs_sin, self.n_kv_heads)
+        # Only apply RoPE to the new tokens at their current positions
+        Q = apply_RoPE(Q, freqs_cos[start_idx:], freqs_sin[start_idx:], self.n_heads)
+        K = apply_RoPE(K, freqs_cos[start_idx:], freqs_sin[start_idx:], self.n_kv_heads)
+        
+        # print("Q after RoPE", Q.shape)
+        # print("K after RoPE", K.shape)
 
-        # update cache
+        # Step 4: Update KV cache
+        if self.k_cache is None:
+            # Initialize cache for first time
+            max_cache_len = 1000  # Set reasonable max length
+            self.k_cache = torch.zeros(max_cache_len, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
+            self.v_cache = torch.zeros(max_cache_len, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
+            self.cache_len = 0
+        
+        # Append new K and V to cache
         self.k_cache[start_idx:start_idx+seq_len] = K
         self.v_cache[start_idx:start_idx+seq_len] = V
-        keys = self.k_cache[:start_idx+seq_len]
-        values = self.v_cache[:start_idx+seq_len]
+        self.cache_len = current_seq_len
+        
+        # print(f"Cache updated: k_cache.shape = {self.k_cache[:self.cache_len].shape}")
+        # print(f"Cache updated: v_cache.shape = {self.v_cache[:self.cache_len].shape}")
 
-        K_repeated = torch.repeat_interleave(keys, self.n_heads//self.n_kv_heads, dim=1)
-        V_repeated = torch.repeat_interleave(values, self.n_heads//self.n_kv_heads, dim=1)
+        # Step 5: Repeat for GQA (use cached values)
+        K_cached = self.k_cache[:self.cache_len]  # [cache_len, 8, 64]
+        V_cached = self.v_cache[:self.cache_len]  # [cache_len, 8, 64]
+        
+        K_repeated = torch.repeat_interleave(K_cached, self.n_heads//self.n_kv_heads, dim=1)  # [cache_len, 32, 64]
+        V_repeated = torch.repeat_interleave(V_cached, self.n_heads//self.n_kv_heads, dim=1)  # [cache_len, 32, 64]
+        
+        # print("K_repeated", K_repeated.shape)
+        # print("V_repeated", V_repeated.shape)
 
+        # Step 6: Transpose for attention
+        Q = Q.transpose(0, 1)        # [32, seq_len, 64]
+        K_repeated = K_repeated.transpose(0, 1)  # [32, cache_len, 64]
+        V_repeated = V_repeated.transpose(0, 1)  # [32, cache_len, 64]
         
-        Q = Q.transpose(0, 1)
-        K_repeated = K_repeated.transpose(0, 1)
-        V_repeated = V_repeated.transpose(0, 1)
+        # print("Q transposed", Q.shape)
+        # print("K_repeated transposed", K_repeated.shape)
 
-        # Fix dtype mismatch - ensure both tensors have same dtype
-        K_repeated_T = K_repeated.transpose(1,2).to(Q.dtype)
-        attn_scores = Q @ K_repeated_T / math.sqrt(self.head_dim)
+        # Step 7: Compute attention with cache
+        attn_scores = Q @ K_repeated.transpose(1,2) / math.sqrt(self.head_dim)
+        # print("attn_scores", attn_scores.shape)  # [32, seq_len, cache_len]
 
-        
-        # Fix mask creation - create proper causal mask
-        total_seq_len = start_idx + seq_len
-        
-        # Create mask with exact same shape as attention scores
-        # attn_scores shape: (n_heads, seq_len, total_seq_len)
-        # mask = torch.zeros_like(attn_scores)
-        
-        # # Apply causal mask - only mask future positions
-        # for i in range(seq_len):
-        #     current_pos = start_idx + i
-        #     # Mask all positions after current position
-        #     mask[:, i, current_pos + 1:] = float('-inf')
-        
-        # # Apply mask to attention scores
-        # attn_scores = attn_scores + mask
-        if seq_len > 1:
-            # Create causal mask for full-sequence forward (no cache yet)
-            attn_mask = torch.full(
-                (seq_len, total_seq_len),
-                float('-inf'),
-                dtype=attn_scores.dtype,
-                device=attn_scores.device
-            )
-            attn_mask = torch.triu(attn_mask, diagonal=1)
-            attn_scores = attn_scores + attn_mask.unsqueeze(0)
-        # else: no mask needed during token-by-token decoding
-        
+        # Step 8: Apply causal mask (only for new tokens)
+        if mask is not None:
+            attn_scores = attn_scores + mask
+            # print("attn_scores with mask", attn_scores.shape)
 
         attn_probs = F.softmax(attn_scores.float(), dim=-1).type_as(Q)
-        output = attn_probs @ V_repeated
-        output = output.transpose(0, 1).contiguous().view(seq_len, -1)
+        # print("attn_probs", attn_probs.shape)
+
+        # Step 9: Attention output
+        output = attn_probs @ V_repeated  # [32, seq_len, 64]
+        # print("output", output.shape)
+
+        output = output.transpose(0, 1).contiguous().view(seq_len, -1)  # [seq_len, 2048]
+        # print("output", output.shape)
 
         return torch.matmul(output, self.wo.T)
         
@@ -198,6 +210,8 @@ class FeedForward(nn.Module):
 
 
 
+# add attn norm
+# add ffn norm
 class TransformerBlock(nn.Module):
     def __init__(self, layer_idx):
         super().__init__()
@@ -217,9 +231,10 @@ class TransformerBlock(nn.Module):
         self.attn_norm = RMSNorm(model[f"layers.{layer_idx}.attention_norm.weight"])
         self.ffn_norm = RMSNorm(model[f"layers.{layer_idx}.ffn_norm.weight"])
 
-    def forward(self, x, start_idx):
+    def forward(self, x, mask, start_idx=0):
+        # change x to bfloat16
         x = x.to(torch.bfloat16)
-        attn_out = x + self.attn(self.attn_norm(x), start_idx)
+        attn_out = x + self.attn(self.attn_norm(x), mask, start_idx)
         ffn_out = attn_out + self.ffn(self.ffn_norm(attn_out))
         return ffn_out
 
@@ -240,8 +255,10 @@ class Transformer(nn.Module):
             freeze=True
         )
         
+        # Final normalization layer
         self.norm = RMSNorm(model["norm.weight"])
         
+        # Output projection layer (hidden_dim -> vocab_size)
         self.output_weights = nn.Parameter(model["output.weight"])
         
         self.layers = nn.ModuleList()
@@ -249,15 +266,27 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_idx))
 
         
-    def forward(self, tokens, start_idx):
+    def forward(self, tokens, start_idx=0):
         x = self.tok_emb(tokens)
+        # print("input_emb", x.shape)
+
+        # Create mask for causal attention
+        seq_len = x.shape[0]
+        current_len = start_idx + seq_len
+        
+        # For KV cache, we only need to mask future positions beyond current_len
+        mask = torch.full((seq_len, current_len), float('-inf'))
+        mask = mask.triu(diagonal=start_idx+1)  # Only mask positions after current position
+        # print("mask", mask.shape)
 
         for layer in self.layers:
-            x = layer(x, start_idx)
+            x = layer(x, mask, start_idx)
         
         x = self.norm(x)
+        # print("after norm", x.shape)
         
         logits = torch.matmul(x, self.output_weights.T).float()
+        # print("logits", logits.shape)
         
         return logits
 
@@ -297,23 +326,29 @@ class PerformanceMetrics:
         if not all([self.start_time, self.first_token_time, self.end_time]):
             return None
         
-        
+        # Time to First Token (TTFT)
         ttft = self.first_token_time - self.start_time
         
+        # End-to-End Latency (E2EL)
         e2el = self.end_time - self.start_time
         
+        # Token Generation Time (excluding TTFT)
         token_gen_time = e2el - ttft
         
+        # Time per Output Token (TPOT)
         output_tokens = self.total_tokens_generated - self.input_tokens
         tpot = token_gen_time / max(output_tokens - 1, 1) if output_tokens > 1 else 0
         
+        # Inter-Token Latency (ITL) - average time between consecutive tokens
         itl_times = []
         for i in range(1, len(self.token_times)):
             itl_times.append(self.token_times[i] - self.token_times[i-1])
         avg_itl = sum(itl_times) / len(itl_times) if itl_times else 0
         
+        # Tokens per second
         tokens_per_second = output_tokens / token_gen_time if token_gen_time > 0 else 0
         
+        # Throughput (total tokens / total time)
         throughput = self.total_tokens_generated / e2el if e2el > 0 else 0
         
         return {
@@ -352,69 +387,68 @@ class PerformanceMetrics:
         print("\n")
 
 
-
-# def reset_kv_cache(model):
-#     for layer in model.layers:
-#         layer.attn.k_cache = None
-#         layer.attn.v_cache = None
-
-
 Transformer = Transformer()
-# reset_kv_cache(Transformer)
 
-# Autoregressive generation loop
-def generate_text(transformer, initial_tokens, max_new_tokens=100):
-    
+
+
+
+
+# Autoregressive generation loop with KV cache
+def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100):
+    """
+    Generate text autoregressively using KV cache
+    Args:
+        transformer: The trained transformer model
+        initial_tokens: Starting token sequence
+        max_new_tokens: Maximum number of new tokens to generate
+    """
     # Initialize performance metrics
     metrics = PerformanceMetrics()
     metrics.start_generation(initial_tokens)
     
-    generated_tokens = initial_tokens.clone()
+    # Step 1: Process initial prompt to populate KV cache
+    logits = transformer(initial_tokens, start_idx=0)
     
-    print(f"Starting generation with {len(initial_tokens)} initial tokens")
-    print(f"Initial prompt: {tokenizer.enc.decode(initial_tokens.tolist())}")
+    # Get prediction for next token
+    next_token_logits = logits[-1, :]
+    predicted_token_id = torch.argmax(next_token_logits, dim=-1).item()
+    predicted_token_text = tokenizer.enc.decode([predicted_token_id])
+    
+    # Initialize generation
+    generated_tokens = initial_tokens.clone()
+    current_position = len(initial_tokens)
     
     first_token_recorded = False
     
     for step in range(max_new_tokens):
-        # Get logits for current sequence
-        # start_idx = len(generated_tokens)-1
-        start_idx = len(generated_tokens) - 1 if step > 0 else len(initial_tokens)
-
-        # or start_idx = step
-        logits = transformer(generated_tokens[-1:], start_idx)
-        
-        # Get the logits for the last token (next token prediction)
-        next_token_logits = logits[-1, :]  # Shape: (vocab_size,)
-        
-        # Get the most likely next token
-        next_token_id = torch.argmax(next_token_logits, dim=-1).item()
+        # Create single token tensor for the predicted token
+        new_token = torch.tensor([predicted_token_id])
         
         # Record timing for first token
         if not first_token_recorded:
             metrics.record_first_token()
             first_token_recorded = True
         
+        # Process new token with KV cache
+        new_logits = transformer(new_token, start_idx=current_position)
+        
+        # Get prediction for next token
+        next_token_logits = new_logits[-1, :]
+        predicted_token_id = torch.argmax(next_token_logits, dim=-1).item()
+        predicted_token_text = tokenizer.enc.decode([predicted_token_id])
+        
         # Record token generation time
         metrics.record_token()
         
-        # Decode the new token to see what was generated
-        new_token_text = tokenizer.enc.decode([next_token_id])
-        print(f"Step {step}: Generated token '{new_token_text}' (ID: {next_token_id})")
+        # Print step output in the specified format
+        print(f"Step {step + 1}: Generated token '{predicted_token_text}' (ID: {predicted_token_id})")
         
-        # Add the new token to the sequence
-        generated_tokens = torch.cat([generated_tokens, torch.tensor([next_token_id])])
+        # Add the generated token to the sequence
+        generated_tokens = torch.cat([generated_tokens, torch.tensor([predicted_token_id])])
+        current_position += 1
         
-        # Print progress every 50 tokens
-        if step % 50 == 0:
-            current_text = tokenizer.enc.decode(generated_tokens.tolist())
-            print(f"--- Progress: Generated {len(generated_tokens)} tokens total ---")
-            print(f"Current text: {current_text[-100:]}...")  # Show last 100 chars
-        
-        # Optional: Stop if we hit an end token (using the actual token ID)
-        # The EOT token ID is 128010 based on your special tokens
-        if next_token_id == 128010:  # <|eot_id|> token
-            print(f"Stopped at step {step} due to EOT token")
+        # Optional: Stop if we hit an end token
+        if predicted_token_id == 128010:  # <|eot_id|> token
             break
     
     # End generation timing
@@ -425,9 +459,8 @@ def generate_text(transformer, initial_tokens, max_new_tokens=100):
     
     return generated_tokens
 
-# Run generation
-print("Starting autoregressive generation...")
-generated_tokens = generate_text(Transformer, token_ids, max_new_tokens=100)
+# Run full generation loop with KV cache
+generated_tokens = generate_with_kv_cache(Transformer, token_ids, max_new_tokens=100)
 
 # Decode the final result
 final_text = tokenizer.enc.decode(generated_tokens.tolist())
@@ -436,3 +469,37 @@ print("FINAL GENERATED TEXT:")
 print("="*50)
 print(final_text)
 
+
+
+
+'''
+# for later use:
+# Single token generation with KV cache for debugging
+def debug_single_token_generation(transformer, initial_tokens):
+    print(f"Starting single token generation with KV cache")
+    print(f"Initial prompt: {tokenizer.enc.decode(initial_tokens.tolist())}")
+    print(f"Initial tokens: {initial_tokens.tolist()}")
+    
+    # First, process the initial prompt to populate KV cache
+    print(f"\n=== STEP 1: Process initial prompt ===")
+    logits = transformer(initial_tokens, start_idx=0)
+    
+    # Get prediction for next token
+    next_token_logits = logits[-1, :]
+    predicted_token_id = torch.argmax(next_token_logits, dim=-1).item()
+    predicted_token_text = tokenizer.enc.decode([predicted_token_id])
+    
+    print(f"\n=== STEP 2: Generate next token ===")
+    print(f"Predicted next token: '{predicted_token_text}' (ID: {predicted_token_id})")
+    
+    # Now generate the next token using KV cache
+    new_token = torch.tensor([predicted_token_id])
+    print(f"\n=== STEP 3: Process new token with KV cache ===")
+    print(f"Processing new token: '{predicted_token_text}' at position {len(initial_tokens)}")
+    
+    # This should use KV cache and only process 1 new token
+    new_logits = transformer(new_token, start_idx=len(initial_tokens))
+    
+    return new_logits, predicted_token_id
+
+'''
