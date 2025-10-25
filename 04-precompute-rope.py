@@ -1,37 +1,14 @@
-'''
-Paged attention implementation:
--Not useful for single prompt sequence generation
--slower than the straight forward kvcache implementation
--but it's more memory efficient
-'''
-
-
-
 import torch 
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 import time
 
-import torch.profiler
-from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
-
-
 import config
 import tokenizer
 
-
-# OPTIMIZATION:
-# paged attention
-
-
-profiler_schedule = torch.profiler.schedule(
-    wait=0,
-    warmup=0,   
-    active=10,   
-    repeat=1
-)
-
+# print(config.DIM)
+# print(tokenizer.enc.encode("Hello, world!"))
 
 model = torch.load("Llama3.2-1B-Instruct/consolidated.00.pth", map_location=torch.device('cpu'))
 
@@ -65,6 +42,8 @@ class RMSNorm(nn.Module):
 
 
 # head_dim = 64 
+
+
 def precompute_freqs_cis(head_dim, end, theta=config.ROPE_THETA):
     freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2)[: (head_dim // 2)].float() / head_dim))
     t = torch.arange(end) #  0,1,2...seq_len-1
@@ -79,6 +58,7 @@ def precompute_freqs_cis(head_dim, end, theta=config.ROPE_THETA):
 
 
 def apply_RoPE(x, freqs_cos, freqs_sin, n_heads):
+
     # x shape: (seq_len, n_heads, head_dim)
     x_even = x[:, :, ::2]
     x_odd = x[:, :, 1::2]
@@ -98,7 +78,13 @@ def apply_RoPE(x, freqs_cos, freqs_sin, n_heads):
 def repeat_kv():
     pass
 
-
+# Find query, key, value matrices (Q = wq * input...)
+# reshape all matrices to (batch, n_heads, seq_len, head_dim)
+# appply rope to Q,K
+# multiply q,kT divide by sqrt d
+# apply masking to this
+# apply softmax to this
+# multiply the whole thing by V
 class MHA(nn.Module):
     def __init__(self, wq, wk, wv, wo, n_heads=config.N_HEADS, n_kv_heads=config.N_KV_HEADS):
         super().__init__()
@@ -110,127 +96,98 @@ class MHA(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.head_dim = config.DIM // self.n_heads # 32 heads * 64 dim = 2048 dim
         
-        # Paged attention
-        self.page_size = 16
-        self.page_offset = 0
-        self.kv_pages = []
-
+        # Initialize KV cache
+        self.k_cache = None
+        self.v_cache = None
+        self.cache_len = 0
 
 
     # x is input embeddings - now only processes new tokens
-    def forward(self, x, mask):
-        with record_function("MHA.forward"):
-            seq_len = x.shape[0]  # Should be 1 for single token generation
+    def forward(self, x, mask, freqs_cos, freqs_sin, start_idx=0):
+        seq_len = x.shape[0]  # Should be 1 for single token generation
         
-            # print(f"Processing {seq_len} new tokens")
+        # print(f"Processing {seq_len} new tokens starting at position {start_idx}")
         
-            # Step 1: Compute Q, K, V for new tokens only
-            x = x.to(self.wq.dtype)
-            Q = torch.matmul(x, self.wq.T) #[seq_len, 2048]
-            K = torch.matmul(x, self.wk.T)  
-            V = torch.matmul(x, self.wv.T) 
+        # Step 1: Compute Q, K, V for new tokens only
+        x = x.to(self.wq.dtype)
+        Q = torch.matmul(x, self.wq.T)  # [seq_len, 2048]
+        K = torch.matmul(x, self.wk.T)  # [seq_len, 2048] 
+        V = torch.matmul(x, self.wv.T)  # [seq_len, 2048]
         
-            # print("Q.shape", Q.shape)
-            # print("K.shape", K.shape) 
-            # print("V.shape", V.shape)
+        # print("Q.shape", Q.shape)
+        # print("K.shape", K.shape) 
+        # print("V.shape", V.shape)
 
-            # Step 2: Reshape to head format
-            Q = Q.view(seq_len, self.n_heads, self.head_dim)     # [seq_len, 32, 64]
-            K = K.view(seq_len, self.n_kv_heads, self.head_dim)  # [seq_len, 8, 64]
-            V = V.view(seq_len, self.n_kv_heads, self.head_dim)  # [seq_len, 8, 64]
+        # Step 2: Reshape to head format
+        Q = Q.view(seq_len, self.n_heads, self.head_dim)     # [seq_len, 32, 64]
+        K = K.view(seq_len, self.n_kv_heads, self.head_dim)  # [seq_len, 8, 64]
+        V = V.view(seq_len, self.n_kv_heads, self.head_dim)  # [seq_len, 8, 64]
 
-            # Step 3: Apply RoPE for current position only
-            # Calculate current position based on paged cache
-            current_position = (len(self.kv_pages) - 1) * self.page_size + self.page_offset if len(self.kv_pages) > 0 else 0
-            current_seq_len = current_position + seq_len
-            freqs_cos, freqs_sin = precompute_freqs_cis(self.head_dim, current_seq_len)
+        # Step 3: Apply RoPE for current position only
+        current_seq_len = start_idx + seq_len
+        # freqs_cos, freqs_sin = precompute_freqs_cis(self.head_dim, current_seq_len)
         
-            # Only apply RoPE to the new tokens at their current positions
-            Q = apply_RoPE(Q, freqs_cos[current_position:], freqs_sin[current_position:], self.n_heads)
-            K = apply_RoPE(K, freqs_cos[current_position:], freqs_sin[current_position:], self.n_kv_heads)
+        # Only apply RoPE to the new tokens at their current positions
+        Q = apply_RoPE(Q, freqs_cos[start_idx:], freqs_sin[start_idx:], self.n_heads)
+        K = apply_RoPE(K, freqs_cos[start_idx:], freqs_sin[start_idx:], self.n_kv_heads)
         
-            # print("Q after RoPE", Q.shape)
-            # print("K after RoPE", K.shape)
+        # print("Q after RoPE", Q.shape)
+        # print("K after RoPE", K.shape)
 
-            # Paged attention
-            tokens_remaining = seq_len
-            token_offset = 0
-            
-            while tokens_remaining > 0:
-                # Check if we need a new page
-                if len(self.kv_pages) == 0 or self.page_offset == self.page_size:
-                    k_page = torch.zeros(self.page_size, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
-                    v_page = torch.zeros(self.page_size, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
-                    self.kv_pages.append((k_page, v_page))
-                    self.page_offset = 0
-                
-                # Calculate how many tokens we can fit in the current page
-                tokens_in_current_page = min(tokens_remaining, self.page_size - self.page_offset)
-                
-                # Write tokens to the current page
-                k_page, v_page = self.kv_pages[-1]
-                k_page[self.page_offset:self.page_offset+tokens_in_current_page] = K[token_offset:token_offset+tokens_in_current_page]
-                v_page[self.page_offset:self.page_offset+tokens_in_current_page] = V[token_offset:token_offset+tokens_in_current_page]
-                
-                # Update offsets
-                self.page_offset += tokens_in_current_page
-                token_offset += tokens_in_current_page
-                tokens_remaining -= tokens_in_current_page
-
-
-                
-                # get all k and v pages, and slice off unused part of last page
-            if len(self.kv_pages) == 0:
-                k_cached = torch.zeros(0, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
-                v_cached = torch.zeros(0, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
-            else:
-                # Calculate total cached length: (num_complete_pages * page_size) + current_page_offset
-                total_cached_len = (len(self.kv_pages) - 1) * self.page_size + self.page_offset
-                
-                k_pages = [page[0] for page in self.kv_pages]
-                v_pages = [page[1] for page in self.kv_pages]
-                k_pages = torch.cat(k_pages, dim=0)
-                v_pages = torch.cat(v_pages, dim=0)
-                k_cached = k_pages[:total_cached_len]
-                v_cached = v_pages[:total_cached_len]
-            
-            # print("k_cached", k_cached.shape)
-            # print("v_cached", v_cached.shape)
-
+        # Step 4: Update KV cache
+        if self.k_cache is None:
+            # Initialize cache for first time
+            max_cache_len = 1000  # Set reasonable max length
+            self.k_cache = torch.zeros(max_cache_len, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
+            self.v_cache = torch.zeros(max_cache_len, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
+            self.cache_len = 0
         
-            K_repeated = torch.repeat_interleave(k_cached, self.n_heads//self.n_kv_heads, dim=1)  # [cache_len, 32, 64]
-            V_repeated = torch.repeat_interleave(v_cached, self.n_heads//self.n_kv_heads, dim=1)  # [cache_len, 32, 64]
+        # Append new K and V to cache
+        self.k_cache[start_idx:start_idx+seq_len] = K
+        self.v_cache[start_idx:start_idx+seq_len] = V
+        self.cache_len = current_seq_len
         
-            # print("K_repeated", K_repeated.shape)
-            # print("V_repeated", V_repeated.shape)
+        # print(f"Cache updated: k_cache.shape = {self.k_cache[:self.cache_len].shape}")
+        # print(f"Cache updated: v_cache.shape = {self.v_cache[:self.cache_len].shape}")
 
-            
-            Q = Q.transpose(0, 1)        # [32, seq_len, 64]
-            K_repeated = K_repeated.transpose(0, 1)  # [32, cache_len, 64]
-            V_repeated = V_repeated.transpose(0, 1)  # [32, cache_len, 64]
+        # Step 5: Repeat for GQA (use cached values)
+        K_cached = self.k_cache[:self.cache_len]  # [cache_len, 8, 64]
+        V_cached = self.v_cache[:self.cache_len]  # [cache_len, 8, 64]
         
-            # print("Q transposed", Q.shape)
-            # print("K_repeated transposed", K_repeated.shape)
+        K_repeated = torch.repeat_interleave(K_cached, self.n_heads//self.n_kv_heads, dim=1)  # [cache_len, 32, 64]
+        V_repeated = torch.repeat_interleave(V_cached, self.n_heads//self.n_kv_heads, dim=1)  # [cache_len, 32, 64]
+        
+        # print("K_repeated", K_repeated.shape)
+        # print("V_repeated", V_repeated.shape)
 
-            
-            attn_scores = Q @ K_repeated.transpose(1,2) / math.sqrt(self.head_dim)
-            # print("attn_scores", attn_scores.shape)  # [32, seq_len, cache_len]
+        # Step 6: Transpose for attention
+        Q = Q.transpose(0, 1)        # [32, seq_len, 64]
+        K_repeated = K_repeated.transpose(0, 1)  # [32, cache_len, 64]
+        V_repeated = V_repeated.transpose(0, 1)  # [32, cache_len, 64]
+        
+        # print("Q transposed", Q.shape)
+        # print("K_repeated transposed", K_repeated.shape)
 
-            if mask is not None:
-                attn_scores = attn_scores + mask
+        # Step 7: Compute attention with cache
+        attn_scores = Q @ K_repeated.transpose(1,2) / math.sqrt(self.head_dim)
+        # print("attn_scores", attn_scores.shape)  # [32, seq_len, cache_len]
+
+        # Step 8: Apply causal mask (only for new tokens)
+        if mask is not None:
+            attn_scores = attn_scores + mask
             # print("attn_scores with mask", attn_scores.shape)
 
-            attn_probs = F.softmax(attn_scores.float(), dim=-1).type_as(Q)
-            # print("attn_probs", attn_probs.shape)
+        attn_probs = F.softmax(attn_scores.float(), dim=-1).type_as(Q)
+        # print("attn_probs", attn_probs.shape)
 
-            
-            output = attn_probs @ V_repeated  # [32, seq_len, 64]
-            # print("output", output.shape)
+        # Step 9: Attention output
+        output = attn_probs @ V_repeated  # [32, seq_len, 64]
+        # print("output", output.shape)
 
-            output = output.transpose(0, 1).contiguous().view(seq_len, -1)  # [seq_len, 2048]
-            # print("output", output.shape)
+        output = output.transpose(0, 1).contiguous().view(seq_len, -1)  # [seq_len, 2048]
+        # print("output", output.shape)
 
-            return torch.matmul(output, self.wo.T)
+        return torch.matmul(output, self.wo.T)
         
 
 
@@ -274,13 +231,12 @@ class TransformerBlock(nn.Module):
         self.attn_norm = RMSNorm(model[f"layers.{layer_idx}.attention_norm.weight"])
         self.ffn_norm = RMSNorm(model[f"layers.{layer_idx}.ffn_norm.weight"])
 
-    def forward(self, x, mask):
-        with record_function("TransformerBlock.forward"):
-            # change x to bfloat16
-            x = x.to(torch.bfloat16)
-            attn_out = x + self.attn(self.attn_norm(x), mask)
-            ffn_out = attn_out + self.ffn(self.ffn_norm(attn_out))
-            return ffn_out
+    def forward(self, x, mask, freqs_cos, freqs_sin, start_idx=0):
+        # change x to bfloat16
+        x = x.to(torch.bfloat16)
+        attn_out = x + self.attn(self.attn_norm(x), mask, freqs_cos, freqs_sin, start_idx)
+        ffn_out = attn_out + self.ffn(self.ffn_norm(attn_out))
+        return ffn_out
 
 
 
@@ -293,6 +249,7 @@ class Transformer(nn.Module):
         super().__init__()
         self.n_layers = config.N_LAYERS
         self.vocab_size = config.VOCAB_SIZE
+        self.head_dim = config.DIM // config.N_HEADS # 32 heads * 64 dim = 2048 dim
         
         self.tok_emb = nn.Embedding.from_pretrained(
             model["tok_embeddings.weight"], 
@@ -310,24 +267,32 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_idx))
 
         
-    def forward(self, tokens):
-        with record_function("Transformer.forward"):
-            x = self.tok_emb(tokens)
-            # print("input_emb", x.shape)
 
-            # for now
-            mask = None
+        
+    def forward(self, tokens, start_idx=0):
+        x = self.tok_emb(tokens)
+        # print("input_emb", x.shape)
 
-            for layer in self.layers:
-                x = layer(x, mask)
-            
-            x = self.norm(x)
-            # print("after norm", x.shape)
-            
-            logits = torch.matmul(x, self.output_weights.T).float()
-            # print("logits", logits.shape)
-            
-            return logits
+        # Create mask for causal attention
+        seq_len = x.shape[0]
+        current_len = start_idx + seq_len
+        
+        # For KV cache, we only need to mask future positions beyond current_len
+        mask = torch.full((seq_len, current_len), float('-inf'))
+        mask = mask.triu(diagonal=start_idx+1)  # Only mask positions after current position
+        # print("mask", mask.shape)
+        freqs_cos, freqs_sin = precompute_freqs_cis(self.head_dim, current_len)
+
+        for layer in self.layers:
+            x = layer(x, mask, freqs_cos, freqs_sin, start_idx)
+        
+        x = self.norm(x)
+        # print("after norm", x.shape)
+        
+        logits = torch.matmul(x, self.output_weights.T).float()
+        # print("logits", logits.shape)
+        
+        return logits
 
         
         
@@ -433,26 +398,20 @@ Transformer = Transformer()
 
 
 # Autoregressive generation loop with KV cache
-def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100, profiler=None):
+def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100):
     """
     Generate text autoregressively using KV cache
     Args:
         transformer: The trained transformer model
         initial_tokens: Starting token sequence
         max_new_tokens: Maximum number of new tokens to generate
-        profiler: Optional profiler instance for step tracking
     """
-    # Reset KV pages for all layers
-    for layer in transformer.layers:
-        layer.attn.kv_pages = []
-        layer.attn.page_offset = 0
-    
     # Initialize performance metrics
     metrics = PerformanceMetrics()
     metrics.start_generation(initial_tokens)
     
     # Step 1: Process initial prompt to populate KV cache
-    logits = transformer(initial_tokens)
+    logits = transformer(initial_tokens, start_idx=0)
     
     # Get prediction for next token
     next_token_logits = logits[-1, :]
@@ -461,6 +420,7 @@ def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100, prof
     
     # Initialize generation
     generated_tokens = initial_tokens.clone()
+    current_position = len(initial_tokens)
     
     first_token_recorded = False
     
@@ -474,7 +434,7 @@ def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100, prof
             first_token_recorded = True
         
         # Process new token with KV cache
-        new_logits = transformer(new_token)
+        new_logits = transformer(new_token, start_idx=current_position)
         
         # Get prediction for next token
         next_token_logits = new_logits[-1, :]
@@ -489,12 +449,9 @@ def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100, prof
         
         # Add the generated token to the sequence
         generated_tokens = torch.cat([generated_tokens, torch.tensor([predicted_token_id])])
+        current_position += 1
         
-        # Call profiler step if profiler is provided
-        if profiler is not None:
-            profiler.step()
-        
-        
+        # Optional: Stop if we hit an end token
         if predicted_token_id == 128010:  # <|eot_id|> token
             break
     
@@ -506,20 +463,8 @@ def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100, prof
     
     return generated_tokens
 
-
-with profile(
-    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA] if torch.cuda.is_available() else [ProfilerActivity.CPU],
-    schedule=profiler_schedule,
-    on_trace_ready=tensorboard_trace_handler("./logdir"),
-    record_shapes=True,
-    profile_memory=True,
-    with_stack=True
-) as prof:
-
-    generated_tokens = generate_with_kv_cache(Transformer, token_ids, max_new_tokens=100, profiler=prof)
-
 # Run full generation loop with KV cache
-# generated_tokens = generate_with_kv_cache(Transformer, token_ids, max_new_tokens=100)
+generated_tokens = generate_with_kv_cache(Transformer, token_ids, max_new_tokens=100)
 
 # Decode the final result
 final_text = tokenizer.enc.decode(generated_tokens.tolist())
@@ -539,14 +484,9 @@ def debug_single_token_generation(transformer, initial_tokens):
     print(f"Initial prompt: {tokenizer.enc.decode(initial_tokens.tolist())}")
     print(f"Initial tokens: {initial_tokens.tolist()}")
     
-    # Reset KV pages for all layers
-    for layer in transformer.layers:
-        layer.attn.kv_pages = []
-        layer.attn.page_offset = 0
-    
     # First, process the initial prompt to populate KV cache
     print(f"\n=== STEP 1: Process initial prompt ===")
-    logits = transformer(initial_tokens)
+    logits = transformer(initial_tokens, start_idx=0)
     
     # Get prediction for next token
     next_token_logits = logits[-1, :]
@@ -559,15 +499,11 @@ def debug_single_token_generation(transformer, initial_tokens):
     # Now generate the next token using KV cache
     new_token = torch.tensor([predicted_token_id])
     print(f"\n=== STEP 3: Process new token with KV cache ===")
-    print(f"Processing new token: '{predicted_token_text}'")
+    print(f"Processing new token: '{predicted_token_text}' at position {len(initial_tokens)}")
     
     # This should use KV cache and only process 1 new token
-    new_logits = transformer(new_token)
+    new_logits = transformer(new_token, start_idx=len(initial_tokens))
     
     return new_logits, predicted_token_id
 
-
-new_logits, predicted_token_id = debug_single_token_generation(Transformer, token_ids)
-print(f"New logits: {new_logits}")
-print(f"Predicted token ID: {predicted_token_id}")
 '''
