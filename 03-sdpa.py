@@ -153,6 +153,8 @@ class MHA(nn.Module):
         # Step 5: Repeat for GQA (use cached values)
         K_cached = self.k_cache[:self.cache_len]  # [cache_len, 8, 64]
         V_cached = self.v_cache[:self.cache_len]  # [cache_len, 8, 64]
+
+        
         
         K_repeated = torch.repeat_interleave(K_cached, self.n_heads//self.n_kv_heads, dim=1)  # [cache_len, 32, 64]
         V_repeated = torch.repeat_interleave(V_cached, self.n_heads//self.n_kv_heads, dim=1)  # [cache_len, 32, 64]
@@ -164,28 +166,32 @@ class MHA(nn.Module):
         Q = Q.transpose(0, 1)        # [32, seq_len, 64]
         K_repeated = K_repeated.transpose(0, 1)  # [32, cache_len, 64]
         V_repeated = V_repeated.transpose(0, 1)  # [32, cache_len, 64]
+
+        
+        output = F.scaled_dot_product_attention(Q, K_repeated, V_repeated, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=1.0/math.sqrt(self.head_dim), enable_gqa=False)
         
         # print("Q transposed", Q.shape)
         # print("K_repeated transposed", K_repeated.shape)
 
         # Step 7: Compute attention with cache
-        attn_scores = Q @ K_repeated.transpose(1,2) / math.sqrt(self.head_dim)
+        # attn_scores = Q @ K_repeated.transpose(1,2) / math.sqrt(self.head_dim)
         # print("attn_scores", attn_scores.shape)  # [32, seq_len, cache_len]
 
         # Step 8: Apply causal mask (only for new tokens)
-        if mask is not None:
-            attn_scores = attn_scores + mask
+        # if mask is not None:
+            # attn_scores = attn_scores + mask
             # print("attn_scores with mask", attn_scores.shape)
 
-        attn_probs = F.softmax(attn_scores.float(), dim=-1).type_as(Q)
+        # attn_probs = F.softmax(attn_scores.float(), dim=-1).type_as(Q)
         # print("attn_probs", attn_probs.shape)
 
         # Step 9: Attention output
-        output = attn_probs @ V_repeated  # [32, seq_len, 64]
+        # output = attn_probs @ V_repeated  # [32, seq_len, 64]
         # print("output", output.shape)
 
         output = output.transpose(0, 1).contiguous().view(seq_len, -1)  # [seq_len, 2048]
         # print("output", output.shape)
+        
 
         return torch.matmul(output, self.wo.T)
         
