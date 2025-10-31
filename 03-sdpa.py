@@ -9,8 +9,10 @@ import tokenizer
 
 # print(config.DIM)
 # print(tokenizer.enc.encode("Hello, world!"))
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-model = torch.load("Llama3.2-1B-Instruct/consolidated.00.pth", map_location=torch.device('cpu'))
+model = torch.load("Llama3.2-1B-Instruct/consolidated.00.pth", map_location=device)
 
 
 prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|><br><br>If mountains could talk<|eot_id|><|start_header_id|>assistant<|end_header_id|><br><br>"
@@ -19,7 +21,7 @@ prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|><br><br>If mo
 encoded = tokenizer.enc.encode(prompt, allowed_special="all")
 # print(encoded)
 
-token_ids = torch.tensor(encoded)
+token_ids = torch.tensor(encoded, device=device)
 # print(token_ids)
 
 print(token_ids.shape)
@@ -44,9 +46,11 @@ class RMSNorm(nn.Module):
 # head_dim = 64 
 
 
-def precompute_freqs_cis(head_dim, end, theta=config.ROPE_THETA):
-    freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2)[: (head_dim // 2)].float() / head_dim))
-    t = torch.arange(end) #  0,1,2...seq_len-1
+def precompute_freqs_cis(head_dim, end, theta=config.ROPE_THETA, device=None):
+    if device is None:
+        device=torch.device("cpu")
+    freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device)[: (head_dim // 2)].float() / head_dim))
+    t = torch.arange(end, device=device) #  0,1,2...seq_len-1
     freqs_matrix = torch.outer(t, freq) # theta = pos * freq -> shape: (seq_len, head_dim//2)
     freqs_cos = torch.cos(freqs_matrix)
     freqs_sin = torch.sin(freqs_matrix)
@@ -67,7 +71,7 @@ def apply_RoPE(x, freqs_cos, freqs_sin, n_heads):
     freqs_sin_reshaped = freqs_sin.unsqueeze(1).expand(-1, n_heads, -1)  # (seq_len, n_heads, head_dim//2)
     x_even_rot = x_even * freqs_cos_reshaped - x_odd * freqs_sin_reshaped
     x_odd_rot = x_even * freqs_sin_reshaped + x_odd * freqs_cos_reshaped
-    x_rot = torch.zeros_like(x)
+    x_rot = torch.zeros_like(x, device=device)
     x_rot[:, :,::2] = x_even_rot
     x_rot[:, :, 1::2] = x_odd_rot
    
@@ -138,8 +142,8 @@ class MHA(nn.Module):
         if self.k_cache is None:
             # Initialize cache for first time
             max_cache_len = 1000  # Set reasonable max length
-            self.k_cache = torch.zeros(max_cache_len, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
-            self.v_cache = torch.zeros(max_cache_len, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16)
+            self.k_cache = torch.zeros(max_cache_len, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16, device=device)
+            self.v_cache = torch.zeros(max_cache_len, self.n_kv_heads, self.head_dim, dtype=torch.bfloat16, device=device)
             self.cache_len = 0
         
         # Append new K and V to cache
@@ -284,10 +288,10 @@ class Transformer(nn.Module):
         current_len = start_idx + seq_len
         
         # For KV cache, we only need to mask future positions beyond current_len
-        mask = torch.full((seq_len, current_len), float('-inf'))
+        mask = torch.full((seq_len, current_len), float('-inf'), device=x.device)
         mask = mask.triu(diagonal=start_idx+1)  # Only mask positions after current position
         # print("mask", mask.shape)
-        freqs_cos, freqs_sin = precompute_freqs_cis(self.head_dim, current_len)
+        freqs_cos, freqs_sin = precompute_freqs_cis(self.head_dim, current_len, device=x.device)
 
         for layer in self.layers:
             x = layer(x, mask, freqs_cos, freqs_sin, start_idx)
@@ -397,7 +401,7 @@ class PerformanceMetrics:
         print("\n")
 
 
-Transformer = Transformer()
+Transformer = Transformer().to(device)
 
 
 
@@ -432,7 +436,7 @@ def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100):
     
     for step in range(max_new_tokens):
         # Create single token tensor for the predicted token
-        new_token = torch.tensor([predicted_token_id])
+        new_token = torch.tensor([predicted_token_id], device=initial_tokens.device)
         
         # Record timing for first token
         if not first_token_recorded:
@@ -454,7 +458,7 @@ def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100):
         print(f"Step {step + 1}: Generated token '{predicted_token_text}' (ID: {predicted_token_id})")
         
         # Add the generated token to the sequence
-        generated_tokens = torch.cat([generated_tokens, torch.tensor([predicted_token_id])])
+        generated_tokens = torch.cat([generated_tokens, torch.tensor([predicted_token_id], device=generated_tokens.device)])
         current_position += 1
         
         # Optional: Stop if we hit an end token
