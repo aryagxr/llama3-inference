@@ -94,9 +94,13 @@ class PerformanceMetrics:
         print("\n")
 
 model_id = "meta-llama/Llama-3.2-1B-Instruct"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
 pipe = pipeline(
     "text-generation",
     model=model_id,
+    device=device,
     dtype=torch.bfloat16,
 )
 
