@@ -7,6 +7,20 @@ import time
 import config
 import tokenizer
 
+import time
+
+import torch.profiler
+from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
+
+
+profiler_schedule = torch.profiler.schedule(
+    wait=0,
+    warmup=0,   
+    active=10,   
+    repeat=1
+)
+
+
 # print(config.DIM)
 # print(tokenizer.enc.encode("Hello, world!"))
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -408,7 +422,7 @@ Transformer = Transformer().to(device)
 
 
 # Autoregressive generation loop with KV cache
-def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100):
+def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100, profiler=None):
     """
     Generate text autoregressively using KV cache
     Args:
@@ -461,6 +475,10 @@ def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100):
         generated_tokens = torch.cat([generated_tokens, torch.tensor([predicted_token_id], device=generated_tokens.device)])
         current_position += 1
         
+        if profiler is not None:
+            torch.cuda.synchronize()
+            profiler.step()
+
         # Optional: Stop if we hit an end token
         if predicted_token_id == 128010:  # <|eot_id|> token
             break
@@ -473,8 +491,20 @@ def generate_with_kv_cache(transformer, initial_tokens, max_new_tokens=100):
     
     return generated_tokens
 
-# Run full generation loop with KV cache
-generated_tokens = generate_with_kv_cache(Transformer, token_ids, max_new_tokens=100)
+
+
+
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA] if torch.cuda.is_available() else [ProfilerActivity.CPU],
+    schedule=profiler_schedule,
+    on_trace_ready=tensorboard_trace_handler("./log"),
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True
+) as prof:
+    
+
+    generated_tokens = generate_with_kv_cache(Transformer, token_ids, max_new_tokens=100, profiler=prof)
 
 # Decode the final result
 final_text = tokenizer.enc.decode(generated_tokens.tolist())
@@ -482,6 +512,10 @@ print("\n" + "="*50)
 print("FINAL GENERATED TEXT:")
 print("="*50)
 print(final_text)
+
+
+
+
 
 
 
