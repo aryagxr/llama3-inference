@@ -22,7 +22,9 @@ Adds KV cache optimization to avoid recomputing keys and values.
 
 ### 03-sdpa.py
 Uses PyTorch's optimized Scaled Dot Product Attention (SDPA).
-- **Throughput:** ~30.5 tokens/sec *(run to see actual metrics)*
+- **Throughput:** ~30.5 tokens/sec
+
+![KV Cache Token Generation](outputs/sdpa_tokens.gif)
 
 ## How to Run
 
