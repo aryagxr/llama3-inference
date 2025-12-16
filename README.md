@@ -20,11 +20,19 @@ Adds KV cache optimization to avoid recomputing keys and values.
 
 
 
-### 03-sdpa.py
+### 04-sdpa.py
 Uses PyTorch's optimized Scaled Dot Product Attention (SDPA).
 - **Throughput:** ~30.5 tokens/sec
 
-![KV Cache Token Generation](outputs/sdpa_tokens.gif)
+![SDPA Token Generation](outputs/sdpa_tokens.gif)
+
+
+
+### 05-fusedops.py
+Fused qkv proj and ffn proj in the forward pass
+- **Throughput:** ~47.1 tokens/sec
+
+![Fused Token Generation](outputs/fusedops-tokens.gif)
 
 ## How to Run
 
